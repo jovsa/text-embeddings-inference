@@ -231,6 +231,59 @@ build_binary() {
   fi
 }
 
+# Verify Candle GPU usage
+verify_candle_gpu_usage() {
+  local bin="$1"
+  local log_file="$2"
+
+  echo "  🔍 Verifying Candle GPU usage..."
+
+  # Check 1: Verify binary was built with CUDA support
+  if command -v ldd >/dev/null 2>&1; then
+    if ldd "${bin}" 2>/dev/null | grep -q "libcuda\|libcudart"; then
+      echo "  ✅ Binary has CUDA libraries linked"
+    else
+      echo "  ⚠️  Binary does NOT have CUDA libraries - using CPU only"
+      return
+    fi
+  fi
+
+  # Check 2: Look for device info in logs
+  sleep 2  # Give server time to log device info
+  if grep -qi "cuda\|gpu\|device.*cuda" "${log_file}" 2>/dev/null; then
+    echo "  ✅ Logs indicate CUDA/GPU usage"
+    grep -i "cuda\|gpu\|device" "${log_file}" 2>/dev/null | head -3 | sed 's/^/     /'
+  elif grep -qi "using cpu\|device.*cpu" "${log_file}" 2>/dev/null; then
+    echo "  ⚠️  Logs indicate CPU usage (GPU not available or not compiled)"
+    grep -i "cpu\|device" "${log_file}" 2>/dev/null | head -3 | sed 's/^/     /'
+  fi
+
+  # Check 3: Monitor GPU utilization during a test request
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "  🔍 Testing GPU utilization with a sample request..."
+    local port=$(echo "${log_file}" | grep -o "candle" >/dev/null && echo "${CANDLE_PORT:-8081}" || echo "")
+    if [[ -n "${port}" ]]; then
+      # Get baseline GPU usage
+      local baseline=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "0")
+
+      # Make a test request
+      curl -s -X POST "http://127.0.0.1:${port}/embed" \
+        -H "Content-Type: application/json" \
+        -d '{"inputs":"test"}' >/dev/null 2>&1 &
+
+      sleep 1
+      local gpu_usage=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "0")
+
+      if [[ "${gpu_usage}" -gt "${baseline}" ]] && [[ "${gpu_usage}" -gt "5" ]]; then
+        echo "  ✅ GPU utilization detected: ${gpu_usage}% (baseline: ${baseline}%)"
+      else
+        echo "  ⚠️  No significant GPU utilization detected (${gpu_usage}%)"
+        echo "     This may indicate CPU-only mode"
+      fi
+    fi
+  fi
+}
+
 ensure_bin() {
   local name="$1"
   local bin="$2"
@@ -243,6 +296,17 @@ ensure_bin() {
     build_binary "${name}" "${bin}" "${feature}" "${toolchain}"
   else
     echo "✅ ${name} binary found at ${bin}"
+
+    # For Candle, verify CUDA support in binary
+    if [[ "${name}" == "candle" ]]; then
+      if command -v ldd >/dev/null 2>&1; then
+        if ldd "${bin}" 2>/dev/null | grep -q "libcuda\|libcudart"; then
+          echo "   ✅ Binary compiled with CUDA support"
+        else
+          echo "   ⚠️  Binary NOT compiled with CUDA support (will use CPU)"
+        fi
+      fi
+    fi
   fi
 }
 
@@ -286,6 +350,12 @@ start_backend() {
     # Check if health endpoint responds (server is ready)
     if curl -s -f "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       echo "  ✅ ${name} backend is ready!"
+
+      # For Candle backend, check if GPU is being used
+      if [[ "${name}" == "candle" ]]; then
+        verify_candle_gpu_usage "${bin}" "${LOG_DIR}/${name}.log"
+      fi
+
       return 0
     fi
 
@@ -301,10 +371,19 @@ start_backend() {
 # Find available ports for all backends (auto-increment if needed)
 find_all_ports
 
+# Check for CUDA availability to determine Candle feature
+CANDLE_FEATURE="candle"
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  echo "✅ CUDA GPU detected - will build Candle with GPU support"
+  CANDLE_FEATURE="candle-cuda"
+else
+  echo "⚠️  No CUDA GPU detected - will build Candle for CPU only"
+fi
+
 # Ensure all binaries exist (build if needed)
 echo "🔍 Checking for required binaries..."
 ensure_bin "ort" "${ORT_BIN}" "ort"
-ensure_bin "candle" "${CANDLE_BIN}" "candle"
+ensure_bin "candle" "${CANDLE_BIN}" "${CANDLE_FEATURE}"
 ensure_bin "python" "${PY_BIN}" "python" "stable"
 
 # Start all backends

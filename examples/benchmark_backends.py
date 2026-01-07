@@ -41,8 +41,8 @@ Usage:
     # Run benchmark:
     python benchmark_backends.py \
         --candle-url http://127.0.0.1:8080 \
-        --ort-url http://127.0.0.1:8081 \
-        --python-url http://127.0.0.1:8082 \
+        --ort-url http://127.0.0.1:8082 \
+        --python-url http://127.0.0.1:8083 \
         --iterations 50
 
 Python Backend Setup:
