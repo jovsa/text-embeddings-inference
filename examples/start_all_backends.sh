@@ -181,6 +181,34 @@ check_lld() {
   fi
 }
 
+# Check and install pkg-config if needed (required for OpenSSL)
+check_pkg_config() {
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    echo "⚠️  pkg-config not found. Attempting to install..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq && apt-get install -y -qq pkg-config >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y -q pkgconfig >/dev/null 2>&1 || true
+    elif command -v brew >/dev/null 2>&1; then
+      brew install pkg-config >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+# Check and install protobuf compiler if needed (required for Python backend gRPC)
+check_protoc() {
+  if ! command -v protoc >/dev/null 2>&1; then
+    echo "⚠️  protoc (Protocol Buffer compiler) not found. Attempting to install..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y -q protobuf-compiler >/dev/null 2>&1 || true
+    elif command -v brew >/dev/null 2>&1; then
+      brew install protobuf >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 # Build a binary if it doesn't exist
 build_binary() {
   local name="$1"
@@ -189,7 +217,9 @@ build_binary() {
   local toolchain="${4:-}"
 
   local bin_dir="$(dirname "${bin_path}")"
-  mkdir -p "${bin_dir}"
+  # cargo install --root creates a 'bin' subdirectory, so use parent as root
+  local install_root="$(dirname "${bin_dir}")"
+  mkdir -p "${install_root}"
 
   if [[ -x "${bin_path}" ]]; then
     echo "✅ ${name} binary already exists at ${bin_path}"
@@ -198,11 +228,22 @@ build_binary() {
 
   echo "🔨 Building ${name} backend binary (this may take several minutes)..."
 
-  local build_cmd="cargo install --path ${REPO_DIR}/router -F ${feature} --root ${bin_dir}"
+  local build_cmd="cargo install --path ${REPO_DIR}/router -F ${feature} --root ${install_root}"
 
-  # Python backend requires stable toolchain
+  # Python backend requires stable toolchain and additional dependencies
   if [[ "${name}" == "python" ]]; then
     check_lld
+    check_pkg_config
+    check_protoc
+    # Workaround for rust-lld bus error: force use of system linker (bfd/gold) instead of lld
+    # Remove any existing -fuse-ld=lld from RUSTFLAGS and explicitly use bfd
+    if [[ -n "${RUSTFLAGS:-}" ]]; then
+      export RUSTFLAGS="${RUSTFLAGS//-fuse-ld=lld/} -C link-arg=-fuse-ld=bfd"
+    else
+      export RUSTFLAGS="-C link-arg=-fuse-ld=bfd"
+    fi
+    # Also set CARGO_TARGET_* to avoid lld
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="gcc"
     if [[ -n "${toolchain}" ]]; then
       build_cmd="RUSTUP_TOOLCHAIN=${toolchain} ${build_cmd}"
     else
@@ -210,6 +251,35 @@ build_binary() {
       if rustup toolchain list | grep -q "^stable"; then
         build_cmd="RUSTUP_TOOLCHAIN=stable ${build_cmd}"
       fi
+    fi
+  fi
+
+  # Limit parallelism for Candle CUDA builds to avoid OOM
+  if [[ "${name}" == "candle" ]] && [[ "${feature}" == *"cuda"* ]]; then
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+    export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+    # Limit nvcc parallelism (nvcc uses -j flag, but we can limit via MAX_JOBS)
+    export MAX_JOBS="${MAX_JOBS:-1}"
+    # Limit CUDA compiler memory usage (only if CUDAFLAGS is not set)
+    if [[ -z "${CUDAFLAGS:-}" ]]; then
+      export CUDAFLAGS="--maxrregcount=64"
+    else
+      export CUDAFLAGS="${CUDAFLAGS} --maxrregcount=64"
+    fi
+    echo "  ⚙️  Using ${CARGO_BUILD_JOBS} parallel job for CUDA build (to reduce memory usage)"
+    echo "  ⚙️  Limiting nvcc parallelism to ${MAX_JOBS} job(s)"
+
+    # Set CUDA_COMPUTE_CAP if not already set (per Candle installation guide)
+    if [[ -z "${CUDA_COMPUTE_CAP:-}" ]]; then
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '.')
+        if [[ -n "${compute_cap}" ]]; then
+          export CUDA_COMPUTE_CAP="${compute_cap}"
+          echo "  🔧 Setting CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP} (detected from nvidia-smi)"
+        fi
+      fi
+    else
+      echo "  🔧 Using CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP} (from environment)"
     fi
   fi
 
@@ -228,6 +298,37 @@ build_binary() {
   else
     echo "❌ Binary not found at ${bin_path} after build"
     exit 1
+  fi
+}
+
+ensure_bin() {
+  local name="$1"
+  local bin="$2"
+  local feature="$3"
+  local toolchain="${4:-}"
+
+  if [[ ! -x "${bin}" ]]; then
+    echo "📦 Binary for ${name} not found at ${bin}"
+    check_rust
+    # Check for build dependencies before building
+    if [[ "${name}" == "python" ]]; then
+      check_pkg_config
+      check_protoc
+    fi
+    build_binary "${name}" "${bin}" "${feature}" "${toolchain}"
+  else
+    echo "✅ ${name} binary found at ${bin}"
+
+    # For Candle, verify CUDA support in binary
+    if [[ "${name}" == "candle" ]]; then
+      if command -v ldd >/dev/null 2>&1; then
+        if ldd "${bin}" 2>/dev/null | grep -q "libcuda\|libcudart"; then
+          echo "   ✅ Binary compiled with CUDA support"
+        else
+          echo "   ⚠️  Binary NOT compiled with CUDA support (will use CPU)"
+        fi
+      fi
+    fi
   fi
 }
 
@@ -279,32 +380,6 @@ verify_candle_gpu_usage() {
       else
         echo "  ⚠️  No significant GPU utilization detected (${gpu_usage}%)"
         echo "     This may indicate CPU-only mode"
-      fi
-    fi
-  fi
-}
-
-ensure_bin() {
-  local name="$1"
-  local bin="$2"
-  local feature="$3"
-  local toolchain="${4:-}"
-
-  if [[ ! -x "${bin}" ]]; then
-    echo "📦 Binary for ${name} not found at ${bin}"
-    check_rust
-    build_binary "${name}" "${bin}" "${feature}" "${toolchain}"
-  else
-    echo "✅ ${name} binary found at ${bin}"
-
-    # For Candle, verify CUDA support in binary
-    if [[ "${name}" == "candle" ]]; then
-      if command -v ldd >/dev/null 2>&1; then
-        if ldd "${bin}" 2>/dev/null | grep -q "libcuda\|libcudart"; then
-          echo "   ✅ Binary compiled with CUDA support"
-        else
-          echo "   ⚠️  Binary NOT compiled with CUDA support (will use CPU)"
-        fi
       fi
     fi
   fi
@@ -372,19 +447,70 @@ start_backend() {
 find_all_ports
 
 # Check for CUDA availability to determine Candle feature
+# Per Candle installation guide: https://huggingface.github.io/candle/guide/installation.html
+# Allow skipping CUDA build if memory is limited
+SKIP_CANDLE_CUDA="${SKIP_CANDLE_CUDA:-}"
+
 CANDLE_FEATURE="candle"
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-  echo "✅ CUDA GPU detected - will build Candle with GPU support"
+if [[ -n "${SKIP_CANDLE_CUDA}" ]]; then
+  echo "⚠️  SKIP_CANDLE_CUDA is set - will build Candle for CPU only (to save memory)"
+  CANDLE_FEATURE="candle"
+elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  echo "✅ CUDA GPU detected - will build Candle with GPU support (candle-cuda)"
+
+  # Verify CUDA installation per Candle guide
+  if command -v nvcc >/dev/null 2>&1; then
+    echo "  ✅ CUDA compiler (nvcc) found: $(nvcc --version 2>/dev/null | grep -o 'release [0-9.]*' | head -1 || echo 'version check failed')"
+  else
+    echo "  ⚠️  CUDA compiler (nvcc) not found in PATH"
+    echo "     Make sure CUDA is installed and /usr/local/cuda/bin is in PATH"
+  fi
+
+  # Check compute capability
+  compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1)
+  if [[ -n "${compute_cap}" ]]; then
+    echo "  ✅ GPU compute capability: ${compute_cap}"
+  else
+    echo "  ⚠️  Could not determine GPU compute capability"
+  fi
+
   CANDLE_FEATURE="candle-cuda"
 else
   echo "⚠️  No CUDA GPU detected - will build Candle for CPU only"
 fi
 
 # Ensure all binaries exist (build if needed)
+# Build sequentially to avoid memory pressure
 echo "🔍 Checking for required binaries..."
-ensure_bin "ort" "${ORT_BIN}" "ort"
-ensure_bin "candle" "${CANDLE_BIN}" "${CANDLE_FEATURE}"
-ensure_bin "python" "${PY_BIN}" "python" "stable"
+echo "📦 Building backends sequentially to reduce memory usage..."
+
+# Build ORT first (CPU-only, less memory intensive)
+if [[ ! -x "${ORT_BIN}" ]]; then
+  echo ""
+  echo "🔨 [1/3] Building ORT backend..."
+  ensure_bin "ort" "${ORT_BIN}" "ort"
+else
+  echo "✅ [1/3] ORT binary already exists"
+fi
+
+# Build Candle (most memory intensive - build separately)
+if [[ ! -x "${CANDLE_BIN}" ]]; then
+  echo ""
+  echo "🔨 [2/3] Building Candle backend (this is the most memory-intensive step)..."
+  echo "   💡 Tip: If this fails, you can skip Candle and use only ORT/Python backends"
+  ensure_bin "candle" "${CANDLE_BIN}" "${CANDLE_FEATURE}"
+else
+  echo "✅ [2/3] Candle binary already exists"
+fi
+
+# Build Python last
+if [[ ! -x "${PY_BIN}" ]]; then
+  echo ""
+  echo "🔨 [3/3] Building Python backend..."
+  ensure_bin "python" "${PY_BIN}" "python" "stable"
+else
+  echo "✅ [3/3] Python binary already exists"
+fi
 
 # Start all backends
 echo ""

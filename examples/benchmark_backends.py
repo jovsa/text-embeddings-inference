@@ -16,13 +16,15 @@ BACKENDS:
    - Best for: GPU inference, production deployments
    - Features: Flash Attention, CUDA, Metal (Apple Silicon)
    - Build: cargo install --path router -F candle-cuda
-   - Performance: Highest throughput, lowest latency
+   - Performance: Highest throughput, lowest latency (with GPU)
+   - Note: Falls back to CPU if GPU unavailable; ONNX Runtime is faster on CPU
 
 2. ONNX Runtime Backend (ORT)
    - Best for: CPU inference, x86 servers
    - Features: Intel MKL-DNN optimizations
    - Build: cargo install --path router -F ort
-   - Performance: Best CPU performance, 2-3x faster than Python on CPU
+   - Performance: Best CPU performance, 2-3x faster than Candle on CPU
+   - Note: CPU-only; optimized specifically for CPU inference
 
 3. Python Backend (PyTorch)
    - Best for: Flash Attention, HPU (Habana Gaudi), custom models
@@ -65,9 +67,10 @@ import requests
 import time
 import statistics
 import argparse
-from typing import NamedTuple, Dict, List, Optional
+from typing import NamedTuple, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import subprocess
 
 
 class BackendResult(NamedTuple):
@@ -273,6 +276,33 @@ def print_comparison_table(results: List[BackendResult], test_name: str):
                 print(f"  {result.backend_name:<15} Throughput: {throughput_ratio:5.1f}% | Latency: {latency_ratio:5.1f}%")
 
 
+def check_gpu_status() -> Tuple[bool, Optional[str], int]:
+    """Check GPU availability and current utilization.
+
+    Returns:
+        Tuple of (gpu_available, gpu_name, utilization_percent)
+    """
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name,utilization.gpu', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            gpu_info = result.stdout.strip().split('\n')[0]
+            parts = [p.strip() for p in gpu_info.split(',')]
+            if len(parts) >= 2:
+                gpu_name = parts[0]
+                try:
+                    utilization = int(parts[1])
+                    return True, gpu_name, utilization
+                except ValueError:
+                    return True, gpu_name, 0
+            return True, None, 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+        pass
+    return False, None, 0
+
+
 def print_detailed_stats(results: List[BackendResult]):
     """Print detailed statistics for each backend."""
     print(f"\n{'═' * 100}")
@@ -282,11 +312,31 @@ def print_detailed_stats(results: List[BackendResult]):
     for result in results:
         print(f"\n🔹 {result.backend_name} ({result.url})")
         print(f"   Total Latency:      {result.total_ms:8.2f} ms")
-        print(f"   ├─ Tokenization:    {result.tokenization_ms:8.2f} ms ({100*result.tokenization_ms/result.total_ms:.1f}%)" if result.total_ms > 0 else "   ├─ Tokenization:    0.00 ms")
-        print(f"   ├─ Queue:           {result.queue_ms:8.2f} ms ({100*result.queue_ms/result.total_ms:.1f}%)" if result.total_ms > 0 else "   ├─ Queue:           0.00 ms")
-        print(f"   └─ Inference:       {result.inference_ms:8.2f} ms ({100*result.inference_ms/result.total_ms:.1f}%)" if result.total_ms > 0 else "   └─ Inference:       0.00 ms")
+
+        # Calculate server-side time (sum of components)
+        server_time = result.tokenization_ms + result.queue_ms + result.inference_ms
+        other_time = result.total_ms - server_time
+
+        # Calculate percentages based on total latency
+        if result.total_ms > 0:
+            tokenization_pct = 100 * result.tokenization_ms / result.total_ms
+            queue_pct = 100 * result.queue_ms / result.total_ms
+            inference_pct = 100 * result.inference_ms / result.total_ms
+            other_pct = 100 * other_time / result.total_ms
+
+            print(f"   ├─ Tokenization:    {result.tokenization_ms:8.2f} ms ({tokenization_pct:5.1f}%)")
+            print(f"   ├─ Queue:           {result.queue_ms:8.2f} ms ({queue_pct:5.1f}%)")
+            print(f"   ├─ Inference:       {result.inference_ms:8.2f} ms ({inference_pct:5.1f}%)")
+            print(f"   └─ Other*:          {other_time:8.2f} ms ({other_pct:5.1f}%)")
+        else:
+            print(f"   ├─ Tokenization:    0.00 ms")
+            print(f"   ├─ Queue:           0.00 ms")
+            print(f"   └─ Inference:       0.00 ms")
+
         print(f"   Throughput:         {result.throughput:8.2f} req/s")
         print(f"   Success Rate:       {result.success_count}/{result.success_count + result.error_count} ({100*result.success_count/(result.success_count + result.error_count):.1f}%)" if (result.success_count + result.error_count) > 0 else "   Success Rate:       0/0 (0%)")
+        if result.total_ms > 0 and other_time > 0.1:
+            print(f"   * Other includes network latency, serialization, and overhead")
 
 
 def main():
@@ -427,6 +477,76 @@ separate binaries or use different Docker images.
     # Detailed statistics
     print_detailed_stats(results)
 
+    # Performance analysis and diagnostics
+    print(f"\n{'═' * 100}")
+    print("🔍 PERFORMANCE ANALYSIS")
+    print("═" * 100)
+
+    candle_backend = next((r for r in results if r.backend_name == "Candle"), None)
+    ort_backend = next((r for r in results if r.backend_name == "ONNX Runtime"), None)
+
+    if candle_backend and ort_backend:
+        # Check if Candle is slower than ONNX Runtime
+        if candle_backend.total_ms > ort_backend.total_ms * 1.1:  # 10% threshold
+            print(f"\n⚠️  PERFORMANCE NOTICE: Candle is slower than ONNX Runtime")
+            print(f"   Candle latency: {candle_backend.total_ms:.2f} ms")
+            print(f"   ONNX Runtime latency: {ort_backend.total_ms:.2f} ms")
+            print(f"   Difference: {((candle_backend.total_ms / ort_backend.total_ms) - 1) * 100:.1f}% slower")
+
+            # Analyze the breakdown
+            candle_server_time = candle_backend.queue_ms + candle_backend.inference_ms
+            ort_server_time = ort_backend.queue_ms + ort_backend.inference_ms
+            print(f"\n📊 Server-side Processing Time:")
+            print(f"   Candle: {candle_server_time:.2f} ms (Queue: {candle_backend.queue_ms:.2f} ms, Inference: {candle_backend.inference_ms:.2f} ms)")
+            print(f"   ONNX Runtime: {ort_server_time:.2f} ms (Queue: {ort_backend.queue_ms:.2f} ms, Inference: {ort_backend.inference_ms:.2f} ms)")
+
+            # Check GPU availability and usage
+            gpu_available, gpu_name, gpu_utilization = check_gpu_status()
+
+            print(f"\n🔍 GPU Status:")
+            if gpu_available:
+                print(f"   GPU: {gpu_name or 'N/A'}")
+                print(f"   Current utilization: {gpu_utilization}%")
+            else:
+                print(f"   No NVIDIA GPU detected or nvidia-smi not available")
+
+            print(f"\n💡 Possible Explanations:")
+
+            if not gpu_available or gpu_utilization < 5:
+                print(f"   1. ⚠️  Candle is likely running on CPU (not GPU)")
+                print(f"      • No GPU detected or GPU utilization is very low")
+                print(f"      • ONNX Runtime is optimized for CPU with Intel MKL-DNN")
+                print(f"      • For CPU inference, ONNX Runtime can be 2-3x faster than Candle's CPU implementation")
+                print(f"\n   📝 To enable GPU for Candle:")
+                print(f"      • Build with: cargo build --release -F candle-cuda")
+                print(f"      • Ensure CUDA is installed and GPU is available")
+                print(f"      • Verify with: nvidia-smi during inference")
+            else:
+                print(f"   1. ✅ GPU is available and being used")
+                print(f"      • Even with GPU, ONNX Runtime can be faster for certain workloads:")
+                print(f"      • Small models: GPU overhead (kernel launches) can outweigh benefits")
+                print(f"      • CPU-optimized workloads: ONNX Runtime's MKL-DNN is highly optimized")
+                print(f"      • Different batching: Candle's queue time ({candle_backend.queue_ms:.2f} ms) is much higher")
+                print(f"        than ONNX Runtime ({ort_backend.queue_ms:.2f} ms), suggesting different batching behavior")
+
+            if candle_backend.queue_ms > ort_backend.queue_ms * 2:
+                print(f"\n   2. 📦 Queue/Batching Differences:")
+                print(f"      • Candle queue time: {candle_backend.queue_ms:.2f} ms ({100*candle_backend.queue_ms/candle_backend.total_ms:.1f}% of total)")
+                print(f"      • ONNX Runtime queue time: {ort_backend.queue_ms:.2f} ms ({100*ort_backend.queue_ms/ort_backend.total_ms:.1f}% of total)")
+                print(f"      • This suggests different batching strategies or queue behavior")
+
+            print(f"\n   📚 Recommendation:")
+            if not gpu_available or gpu_utilization < 5:
+                print(f"      • For CPU-only: Use ONNX Runtime (best CPU performance)")
+                print(f"      • For GPU: Build Candle with -F candle-cuda for better GPU performance")
+            else:
+                print(f"      • For this workload/model size: ONNX Runtime is faster")
+                print(f"      • Candle GPU excels with larger models and higher batch sizes")
+                print(f"      • Consider testing with larger inputs or higher concurrency")
+        elif ort_backend.total_ms > candle_backend.total_ms * 1.1:
+            print(f"\n✅ Candle is faster than ONNX Runtime (as expected with GPU)")
+            print(f"   This suggests Candle is using GPU acceleration")
+
     # Summary
     print(f"\n{'═' * 100}")
     print("📊 SUMMARY")
@@ -456,11 +576,18 @@ separate binaries or use different Docker images.
 
         if ort_backend:
             print(f"   • ONNX Runtime: Best for CPU-only deployments (x86)")
+            print(f"     Optimized with Intel MKL-DNN for CPU inference")
             print(f"     Trade-off: CPU-only, no GPU support")
+            if candle_backend and ort_backend.total_ms < candle_backend.total_ms:
+                print(f"     ✅ Currently faster than Candle (likely because Candle is on CPU)")
 
         if candle_backend:
             print(f"   • Candle: Best for GPU deployments, production use")
+            print(f"     Requires GPU and CUDA support for optimal performance")
             print(f"     Trade-off: Limited model support compared to Python backend")
+            if ort_backend and candle_backend.total_ms > ort_backend.total_ms:
+                print(f"     ⚠️  Currently slower than ONNX Runtime (likely running on CPU)")
+                print(f"     💡 Build with -F candle-cuda and ensure GPU is available for better performance")
 
     # Save results to JSON if requested
     if args.output:
